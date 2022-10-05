@@ -1,6 +1,7 @@
 """
 Generating lines of code.
 """
+
 import sys
 from functools import partial, wraps
 from typing import Collection, Iterator, List, Optional, Set, Union, cast

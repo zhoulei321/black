@@ -1,6 +1,7 @@
 """
 String transformers that can split and merge strings.
 """
+
 import re
 import sys
 from abc import ABC, abstractmethod

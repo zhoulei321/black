@@ -22,6 +22,7 @@
 
 - Fix a crash when formatting some dicts with parenthesis-wrapped long string keys
   (#3262)
+- Require one empty line after module-level docstrings (#3287)
 
 ### Configuration
 
