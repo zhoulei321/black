@@ -69,6 +69,8 @@
 
 <!-- Changes to Black's terminal output and error messages -->
 
+- Fix emoji rendering on Windows 10+ when standard output is redirected or captured by
+  forcing UTF-8 encoding in this case (#3374)
 - Verbose logging now shows the values of `pyproject.toml` configuration variables
   (#3392)
 - Fix false symlink detection messages in verbose output due to using an incorrect
