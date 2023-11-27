@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Final, Iterator, List, Optional, Union
+from typing import Final, Iterator, List, Optional, Tuple, Union
 
 from black.mode import Mode, Preview
 from black.nodes import (
@@ -12,7 +12,6 @@ from black.nodes import (
     first_leaf_of,
     make_simple_prefix,
     preceding_leaf,
-    syms,
 )
 from blib2to3.pgen2 import token
 from blib2to3.pytree import Leaf, Node
@@ -161,73 +160,54 @@ def make_comment(content: str) -> str:
     return "#" + content
 
 
-def normalize_fmt_off(node: Node, mode: Mode) -> None:
-    """Convert content between `# fmt: off`/`# fmt: on` into standalone comments."""
-    try_again = True
-    while try_again:
-        try_again = convert_one_fmt_off_pair(node, mode)
+def normalize_format_skipping(node: Node, mode: Mode) -> None:
+    """Convert content between `# fmt: off`/`# fmt: on` or on a line with `# fmt:skip`
+    into a STANDALONE_COMMENT leaf containing the content to skip formatting for.
+    """
+    while _convert_one_fmt_off_or_skip(node, mode):
+        pass
 
 
-def convert_one_fmt_off_pair(node: Node, mode: Mode) -> bool:
-    """Convert content of a single `# fmt: off`/`# fmt: on` into a standalone comment.
+def _convert_one_fmt_off_or_skip(node: Node, mode: Mode) -> bool:
+    """Convert one `# fmt: off`/`# fmt: on` pair or single `# fmt:skip` into a
+    STANDALONE_COMMENT leaf. This removes the leaf range from the tree and inserts
+    the unformatted content as the STANDALONE_COMMENT leaf's value.
 
-    Returns True if a pair was converted.
+    Returns True if a format skip was processed.
     """
     for leaf in node.leaves():
         previous_consumed = 0
+
         for comment in list_comments(leaf.prefix, is_endmarker=False):
-            should_pass_fmt = comment.value in FMT_OFF or _contains_fmt_skip_comment(
-                comment.value, mode
-            )
-            if not should_pass_fmt:
+            found_fmt_off = comment.value in FMT_OFF
+            found_fmt_skip = _contains_fmt_skip_comment(comment.value, mode)
+            should_skip_formatting = found_fmt_off or found_fmt_skip
+
+            if not should_skip_formatting:
                 previous_consumed = comment.consumed
                 continue
-            # We only want standalone comments. If there's no previous leaf or
-            # the previous leaf is indentation, it's a standalone comment in
-            # disguise.
-            if should_pass_fmt and comment.type != STANDALONE_COMMENT:
-                prev = preceding_leaf(leaf)
-                if prev:
-                    if comment.value in FMT_OFF and prev.type not in WHITESPACE:
-                        continue
-                    if (
-                        _contains_fmt_skip_comment(comment.value, mode)
-                        and prev.type in WHITESPACE
-                    ):
-                        continue
 
-            ignored_nodes = list(generate_ignored_nodes(leaf, comment, mode))
+            (ignored_nodes, hidden_value, standalone_comment_prefix) = (
+                _gather_data_for_fmt_off(leaf, comment, previous_consumed)
+                if found_fmt_off
+                else _gather_data_for_fmt_skip(leaf, comment)
+            )
+
             if not ignored_nodes:
                 continue
 
-            first = ignored_nodes[0]  # Can be a container node with the `leaf`.
+            first = ignored_nodes[0]
             parent = first.parent
-            prefix = first.prefix
-            if comment.value in FMT_OFF:
-                first.prefix = prefix[comment.consumed :]
-            if _contains_fmt_skip_comment(comment.value, mode):
-                first.prefix = ""
-                standalone_comment_prefix = prefix
-            else:
-                standalone_comment_prefix = (
-                    prefix[:previous_consumed] + "\n" * comment.newlines
-                )
-            hidden_value = "".join(str(n) for n in ignored_nodes)
-            if comment.value in FMT_OFF:
-                hidden_value = comment.value + "\n" + hidden_value
-            if _contains_fmt_skip_comment(comment.value, mode):
-                hidden_value += "  " + comment.value
-            if hidden_value.endswith("\n"):
-                # That happens when one of the `ignored_nodes` ended with a NEWLINE
-                # leaf (possibly followed by a DEDENT).
-                hidden_value = hidden_value[:-1]
+
             first_idx: Optional[int] = None
             for ignored in ignored_nodes:
                 index = ignored.remove()
                 if first_idx is None:
                     first_idx = index
-            assert parent is not None, "INTERNAL ERROR: fmt: on/off handling (1)"
-            assert first_idx is not None, "INTERNAL ERROR: fmt: on/off handling (2)"
+
+            assert parent is not None, "INTERNAL ERROR: format skipping handling (1)"
+            assert first_idx is not None, "INTERNAL ERROR: format skipping handling (2)"
+
             parent.insert_child(
                 first_idx,
                 Leaf(
@@ -242,17 +222,59 @@ def convert_one_fmt_off_pair(node: Node, mode: Mode) -> bool:
     return False
 
 
-def generate_ignored_nodes(
-    leaf: Leaf, comment: ProtoComment, mode: Mode
-) -> Iterator[LN]:
+def _gather_data_for_fmt_off(
+    leaf: Leaf, comment: ProtoComment, previous_consumed: int
+) -> Tuple[List[LN], str, str]:
+    # We only want standalone comments. If there's no previous leaf or
+    # the previous leaf is indentation, it's a standalone comment in
+    # disguise.
+    if comment.type != STANDALONE_COMMENT:
+        prev = preceding_leaf(leaf)
+        if prev and prev.type not in WHITESPACE:
+            return ([], "", "")
+
+    ignored_nodes = list(_generate_ignored_nodes_from_fmt_off(leaf))
+
+    if not ignored_nodes:
+        return ([], "", "")
+
+    first = ignored_nodes[0]  # Can be a container node with the `leaf`.
+    prefix = first.prefix
+
+    first.prefix = prefix[comment.consumed :]
+    standalone_comment_prefix = prefix[:previous_consumed] + "\n" * comment.newlines
+
+    hidden_value = comment.value + "\n" + "".join(str(n) for n in ignored_nodes)
+    if hidden_value.endswith("\n"):
+        # This happens when one of the `ignored_nodes` ended with a NEWLINE
+        # leaf (possibly followed by a DEDENT).
+        hidden_value = hidden_value[:-1]
+
+    return (ignored_nodes, hidden_value, standalone_comment_prefix)
+
+
+def _gather_data_for_fmt_skip(
+    leaf: Leaf, comment: ProtoComment
+) -> Tuple[List[LN], str, str]:
+    ignored_nodes = list(_generate_ignored_nodes_from_fmt_skip(leaf, comment))
+
+    if not ignored_nodes:
+        return ([], "", "")
+
+    first = ignored_nodes[0]  # Can be a container node with the `leaf`.
+    standalone_comment_prefix = first.prefix
+    first.prefix = ""
+
+    hidden_value = "".join(str(n) for n in ignored_nodes) + "  " + comment.value
+
+    return (ignored_nodes, hidden_value, standalone_comment_prefix)
+
+
+def _generate_ignored_nodes_from_fmt_off(leaf: Leaf) -> Iterator[LN]:
     """Starting from the container of `leaf`, generate all leaves until `# fmt: on`.
 
-    If comment is skip, returns leaf only.
     Stops at the end of the block.
     """
-    if _contains_fmt_skip_comment(comment.value, mode):
-        yield from _generate_ignored_nodes_from_fmt_skip(leaf, comment)
-        return
     container: Optional[LN] = container_of(leaf)
     while container is not None and container.type != token.ENDMARKER:
         if is_fmt_on(container):
@@ -293,42 +315,41 @@ def _generate_ignored_nodes_from_fmt_skip(
     leaf: Leaf, comment: ProtoComment
 ) -> Iterator[LN]:
     """Generate all leaves that should be ignored by the `# fmt: skip` from `leaf`."""
-    prev_sibling = leaf.prev_sibling
-    parent = leaf.parent
-    # Need to properly format the leaf prefix to compare it to comment.value,
-    # which is also formatted
-    comments = list_comments(leaf.prefix, is_endmarker=False)
-    if not comments or comment.value != comments[0].value:
-        return
-    if prev_sibling is not None:
+    prev = _get_previous_node_to_ignore(leaf)
+
+    siblings: List[LN] = []
+    if prev is not None and (leaf.get_lineno() or 1) - (prev.get_lineno() or -1) <= 1:
         leaf.prefix = ""
-        siblings = [prev_sibling]
-        while "\n" not in prev_sibling.prefix and prev_sibling.prev_sibling is not None:
-            prev_sibling = prev_sibling.prev_sibling
-            siblings.insert(0, prev_sibling)
-        yield from siblings
-    elif (
-        parent is not None and parent.type == syms.suite and leaf.type == token.NEWLINE
-    ):
-        # The `# fmt: skip` is on the colon line of the if/while/def/class/...
-        # statements. The ignored nodes should be previous siblings of the
-        # parent suite node.
-        leaf.prefix = ""
-        ignored_nodes: List[LN] = []
-        parent_sibling = parent.prev_sibling
-        while parent_sibling is not None and parent_sibling.type != syms.suite:
-            ignored_nodes.insert(0, parent_sibling)
-            parent_sibling = parent_sibling.prev_sibling
-        # Special case for `async_stmt` where the ASYNC token is on the
-        # grandparent node.
-        grandparent = parent.parent
-        if (
-            grandparent is not None
-            and grandparent.prev_sibling is not None
-            and grandparent.prev_sibling.type == token.ASYNC
+        lineno = prev.get_lineno()
+        while (
+            prev is not None
+            and prev.type not in WHITESPACE
+            and prev.get_lineno() == lineno
         ):
-            ignored_nodes.insert(0, grandparent.prev_sibling)
-        yield from iter(ignored_nodes)
+            siblings.insert(0, prev)
+            prev = _get_previous_node_to_ignore(prev)
+
+    yield from siblings
+
+
+def _get_previous_node_to_ignore(node: LN) -> Optional[LN]:
+    """
+    Return previous sibling if it is on the same line as preceding leaf, otherwise
+    return the preceding leaf.
+    """
+    preceding = preceding_leaf(node)
+    previous = node.prev_sibling
+    return (
+        preceding
+        if (
+            previous is None
+            or (
+                preceding is not None
+                and previous.get_lineno() != preceding.get_lineno()
+            )
+        )
+        else previous
+    )
 
 
 def is_fmt_on(container: LN) -> bool:
