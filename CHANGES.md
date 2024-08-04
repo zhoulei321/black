@@ -5,6 +5,8 @@
 ### Stable style
 
 - Fix crash when `# fmt: off` is used before a closing parenthesis or bracket. (#4363)
+- Fix `# fmt: skip` issues of not formating other line when that line is connected to
+  fmt: skip line (#4380)
 
 ### Packaging
 
