@@ -605,7 +605,17 @@ class EmptyLineTracker:
             # Consume the first leaf's extra newlines.
             first_leaf = current_line.leaves[0]
             before = first_leaf.prefix.count("\n")
-            before = min(before, max_allowed)
+            before = (
+                1
+                if self.previous_line
+                and self.previous_line.is_import
+                and self.previous_line.depth == 0
+                and current_line.depth == 0
+                and not current_line.is_import
+                and not current_line.is_comment
+                and Preview.always_one_newline_after_import in self.mode
+                else min(before, max_allowed)
+            )
             first_leaf.prefix = ""
         else:
             before = 0
